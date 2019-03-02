@@ -23,6 +23,7 @@
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/in.h>
+#include <linux/pfkeyv2.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -37,14 +38,16 @@
 #include <log/log.h>
 #include <netdutils/MemBlock.h>
 #include <netdutils/Slice.h>
+#include <processgroup/processgroup.h>
 
 using android::base::GetUintProperty;
 using android::base::unique_fd;
 using android::netdutils::MemBlock;
 using android::netdutils::Slice;
-using android::netdutils::statusFromErrno;
 
-constexpr size_t LOG_BUF_SIZE = 65536;
+// The buffer size for the buffer that records program loading logs, needs to be large enough for
+// the largest kernel program.
+constexpr size_t LOG_BUF_SIZE = 0x20000;
 
 namespace android {
 namespace bpf {
@@ -168,12 +171,16 @@ int bpfFdPin(const base::unique_fd& map_fd, const char* pathname) {
     return bpf(BPF_OBJ_PIN, Slice(&attr, sizeof(attr)));
 }
 
-int mapRetrieve(const char* pathname, uint32_t flag) {
+int bpfFdGet(const char* pathname, uint32_t flag) {
     bpf_attr attr;
     memset(&attr, 0, sizeof(attr));
     attr.pathname = ptr_to_u64((void*)pathname);
     attr.file_flags = flag;
     return bpf(BPF_OBJ_GET, Slice(&attr, sizeof(attr)));
+}
+
+int mapRetrieve(const char* pathname, uint32_t flag) {
+    return bpfFdGet(pathname, flag);
 }
 
 int attachProgram(bpf_attach_type type, uint32_t prog_fd, uint32_t cg_fd) {
@@ -209,19 +216,28 @@ uint64_t getSocketCookie(int sockFd) {
     return sock_cookie;
 }
 
-bool hasBpfSupport() {
-    // ARC P - Temporary declare no BPF support on devices running 4.14 and shipping initially
-    // with P until security concerns with BPF inside the ARC container are resolved.
-    constexpr int kInvalidCmd = -1;
-    bpf(kInvalidCmd, Slice());
-    if (errno == ENOSYS) {
-        // This kernel was not built with support for the bpf(2) syscall. In that case the SDK
-        // level check below is ignored and no BPF support is declared. This forces
-        // FirewallController to fallback on the "legacy" implementation using iptables
-        // xt_qtaguid / xt_owner2 modules.
-        return false;
+int synchronizeKernelRCU() {
+    // This is a temporary hack for network stats map swap on devices running
+    // 4.9 kernels. The kernel code of socket release on pf_key socket will
+    // explicitly call synchronize_rcu() which is exactly what we need.
+    int pfSocket = socket(AF_KEY, SOCK_RAW | SOCK_CLOEXEC, PF_KEY_V2);
+
+    if (pfSocket < 0) {
+        int ret = -errno;
+        ALOGE("create PF_KEY socket failed: %s", strerror(errno));
+        return ret;
     }
-    // ARC P - End.
+
+    // When closing socket, synchronize_rcu() gets called in sock_release().
+    if (close(pfSocket)) {
+        int ret = -errno;
+        ALOGE("failed to close the PF_KEY socket: %s", strerror(errno));
+        return ret;
+    }
+    return 0;
+}
+
+bool hasBpfSupport() {
     struct utsname buf;
     int kernel_version_major;
     int kernel_version_minor;
@@ -238,8 +254,8 @@ bool hasBpfSupport() {
     }
     char dummy;
     ret = sscanf(buf.release, "%d.%d%c", &kernel_version_major, &kernel_version_minor, &dummy);
-    if (ret >= 2 && ((kernel_version_major > 4) ||
-                         (kernel_version_major == 4 && kernel_version_minor >= 9))) {
+    if (ret >= 2 &&
+        ((kernel_version_major > 4) || (kernel_version_major == 4 && kernel_version_minor >= 9))) {
         // Check if the device is shipped originally with android P.
         return api_level >= MINIMUM_API_REQUIRED;
     }
@@ -257,7 +273,13 @@ int loadAndPinProgram(BpfProgInfo* prog, Slice progBlock) {
         return ret;
     }
     if (prog->attachType == BPF_CGROUP_INET_EGRESS || prog->attachType == BPF_CGROUP_INET_INGRESS) {
-        unique_fd cg_fd(open(CGROUP_ROOT_PATH, O_DIRECTORY | O_RDONLY | O_CLOEXEC));
+        std::string cg2_path;
+        if (!CgroupGetControllerPath(CGROUPV2_CONTROLLER_NAME, &cg2_path)) {
+            int ret = -errno;
+            ALOGE("Failed to find cgroup v2 root");
+            return ret;
+        }
+        unique_fd cg_fd(open(cg2_path.c_str(), O_DIRECTORY | O_RDONLY | O_CLOEXEC));
         if (cg_fd < 0) {
             int ret = -errno;
             ALOGE("Failed to open the cgroup directory");
@@ -283,7 +305,7 @@ int loadAndPinProgram(BpfProgInfo* prog, Slice progBlock) {
 
 int extractAndLoadProg(BpfProgInfo* prog, Elf64_Shdr* sectionPtr, Slice fileContents,
                        const std::vector<BpfMapInfo>& mapPatterns) {
-    uint64_t progSize = (uint64_t) sectionPtr->sh_size;
+    uint64_t progSize = (uint64_t)sectionPtr->sh_size;
     Slice progSection = take(drop(fileContents, sectionPtr->sh_offset), progSize);
     if (progSection.size() < progSize) {
         ALOGE("programSection out of bound");
@@ -326,7 +348,7 @@ int parsePrograms(Slice fileContents, BpfProgInfo* programs, size_t size,
         return -EINVAL;
     }
 
-    Elf64_Ehdr* elf = (Elf64_Ehdr*) elfHeader.base();
+    Elf64_Ehdr* elf = (Elf64_Ehdr*)elfHeader.base();
     // Find section names string table. This is the section whose index is e_shstrndx.
     if (elf->e_shstrndx == SHN_UNDEF) {
         ALOGE("cannot locate namesSection\n");
@@ -340,13 +362,13 @@ int parsePrograms(Slice fileContents, BpfProgInfo* programs, size_t size,
     }
 
     Slice namesSection =
-            take(drop(sections, elf->e_shstrndx * sizeof(Elf64_Shdr)), sizeof(Elf64_Shdr));
+        take(drop(sections, elf->e_shstrndx * sizeof(Elf64_Shdr)), sizeof(Elf64_Shdr));
     if (namesSection.size() != sizeof(Elf64_Shdr)) {
         ALOGE("namesSection corrupted");
         return -EMSGSIZE;
     }
-    size_t strTabOffset = ((Elf64_Shdr*) namesSection.base())->sh_offset;
-    size_t strTabSize = ((Elf64_Shdr*) namesSection.base())->sh_size;
+    size_t strTabOffset = ((Elf64_Shdr*)namesSection.base())->sh_offset;
+    size_t strTabSize = ((Elf64_Shdr*)namesSection.base())->sh_size;
 
     Slice strTab = take(drop(fileContents, strTabOffset), strTabSize);
     if (strTab.size() < strTabSize) {
@@ -362,7 +384,7 @@ int parsePrograms(Slice fileContents, BpfProgInfo* programs, size_t size,
                   i, section.size(), sizeof(Elf64_Shdr), sections.size());
             return -EBADF;
         }
-        Elf64_Shdr* sectionPtr = (Elf64_Shdr*) section.base();
+        Elf64_Shdr* sectionPtr = (Elf64_Shdr*)section.base();
         Slice nameSlice = drop(strTab, sectionPtr->sh_name);
         if (nameSlice.size() == 0) {
             ALOGE("nameSlice out of bound, i: %d, strTabSize: %zu, sh_name: %u", i, strTabSize,
@@ -371,7 +393,7 @@ int parsePrograms(Slice fileContents, BpfProgInfo* programs, size_t size,
         }
         for (size_t i = 0; i < size; i++) {
             BpfProgInfo* prog = programs + i;
-            if (!strcmp((char*) nameSlice.base(), prog->name)) {
+            if (!strcmp((char*)nameSlice.base(), prog->name)) {
                 int ret = extractAndLoadProg(prog, sectionPtr, fileContents, mapPatterns);
                 if (ret) return ret;
             }
@@ -407,8 +429,7 @@ int parseProgramsFromFile(const char* path, BpfProgInfo* programs, size_t size,
     }
 
     off_t fileLen = stat.st_size;
-    char* baseAddr =
-            (char*) mmap(NULL, fileLen, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd.get(), 0);
+    char* baseAddr = (char*)mmap(NULL, fileLen, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd.get(), 0);
     if (baseAddr == MAP_FAILED) {
         ALOGE("Failed to map the program (%s) into memory: %s", path, strerror(errno));
         ret = -errno;

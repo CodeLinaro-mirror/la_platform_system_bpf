@@ -116,8 +116,8 @@ struct BpfMapInfo {
         : BpfMapInfo(dummyFd, android::bpf::mapRetrieve(mapPath, 0)) {}
 
     BpfMapInfo(uint64_t dummyFd, int realFd, const char* mapPath = "") : fd(realFd), path(mapPath) {
-        search = BPF_MAP_SEARCH_PATTERN((uint8_t*) &dummyFd);
-        replace = BPF_MAP_REPLACE_PATTERN((uint8_t*) &realFd);
+        search = BPF_MAP_SEARCH_PATTERN((uint8_t*)&dummyFd);
+        replace = BPF_MAP_REPLACE_PATTERN((uint8_t*)&realFd);
     }
 };
 
@@ -125,16 +125,14 @@ struct BpfMapInfo {
 #define DEFAULT_OVERFLOWUID 65534
 #endif
 
-constexpr const char* CGROUP_ROOT_PATH = "/dev/cg2_bpf";
-
 constexpr const int OVERFLOW_COUNTERSET = 2;
 
 constexpr const uint64_t NONEXISTENT_COOKIE = 0;
 
 constexpr const int MINIMUM_API_REQUIRED = 28;
 
-int createMap(bpf_map_type map_type, uint32_t key_size, uint32_t value_size,
-              uint32_t max_entries, uint32_t map_flags);
+int createMap(bpf_map_type map_type, uint32_t key_size, uint32_t value_size, uint32_t max_entries,
+              uint32_t map_flags);
 int writeToMapEntry(const base::unique_fd& map_fd, void* key, void* value, uint64_t flags);
 int findMapEntry(const base::unique_fd& map_fd, void* key, void* value);
 int deleteMapEntry(const base::unique_fd& map_fd, void* key);
@@ -143,12 +141,14 @@ int getFirstMapKey(const base::unique_fd& map_fd, void* firstKey);
 int bpfProgLoad(bpf_prog_type prog_type, netdutils::Slice bpf_insns, const char* license,
                 uint32_t kern_version, netdutils::Slice bpf_log);
 int bpfFdPin(const base::unique_fd& map_fd, const char* pathname);
+int bpfFdGet(const char* pathname, uint32_t flags);
 int attachProgram(bpf_attach_type type, uint32_t prog_fd, uint32_t cg_fd);
 int detachProgram(bpf_attach_type type, uint32_t cg_fd);
 uint64_t getSocketCookie(int sockFd);
 bool hasBpfSupport();
 int parseProgramsFromFile(const char* path, BpfProgInfo* programs, size_t size,
                           const std::vector<BpfMapInfo>& mapPatterns);
+int synchronizeKernelRCU();
 
 #define SKIP_IF_BPF_NOT_SUPPORTED     \
     do {                              \

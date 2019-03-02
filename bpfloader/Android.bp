@@ -37,23 +37,17 @@ cc_binary {
         "liblog",
         "libnetdbpf",
         "libnetdutils",
+        "libbpf",
     ],
     srcs: [
         "BpfLoader.cpp",
     ],
 
+    init_rc: ["bpfloader.rc"],
+
     required: [
-        "bpf_kern.o",
+        "netd.o",
+        "time_in_state.o",
     ],
 
-}
-
-bpf {
-    name: "bpf_kern.o",
-    srcs: ["bpf_kern.c"],
-    cflags: [
-        "-Wall",
-        "-Werror",
-    ],
-    include_dirs: ["system/netd/libnetdbpf/include"],
 }
