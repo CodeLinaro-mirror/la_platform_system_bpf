@@ -47,7 +47,6 @@
 #include <netdutils/Misc.h>
 #include <netdutils/Slice.h>
 #include "bpf/BpfUtils.h"
-#include "netdbpf/bpf_shared.h"
 
 using android::base::EndsWith;
 using android::base::unique_fd;
@@ -93,8 +92,10 @@ int main() {
         return 0;
     }
 
-    // Load all ELF objects, create programs and maps, and pin them
-    loadAllElfObjects();
+    if (android::bpf::getBpfSupportLevel() != android::bpf::BpfLevel::NONE) {
+        // Load all ELF objects, create programs and maps, and pin them
+        loadAllElfObjects();
+    }
 
     if (android::base::SetProperty("bpf.progs_loaded", "1") == false) {
         ALOGE("Failed to set bpf.progs_loaded property\n");
